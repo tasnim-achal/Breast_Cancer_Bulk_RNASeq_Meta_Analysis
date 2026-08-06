@@ -1,0 +1,150 @@
+# =============================================================================
+# Script 05: GSEA (Gene Set Enrichment Analysis) with Fallback Support
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(clusterProfiler)
+  library(enrichplot)
+  library(msigdbr)
+  library(ggplot2)
+  library(org.Hs.eg.db)
+  library(cowplot)
+})
+
+# ---- Configuration ----------------------------------------------------------
+fig_dir   <- "figures"
+table_dir <- "tables"
+data_dir  <- "data"
+
+if (!dir.exists(fig_dir))   dir.create(fig_dir, recursive = TRUE)
+if (!dir.exists(table_dir)) dir.create(table_dir, recursive = TRUE)
+
+# ---- Load DESeq2 results from Script 03 ------------------------------------
+cat("Loading DESeq2 results from Script 03...\n")
+res_shrunk <- readRDS(file.path(data_dir, "deseq2_res_shrunk.rds"))
+
+# ---- Step 1: Prepare ranked gene list --------------------------------------
+res_df <- as.data.frame(res_shrunk)
+res_df$symbol <- rownames(res_df)
+
+mapping_file <- file.path(data_dir, "gene_mapping.rds")
+if (file.exists(mapping_file)) {
+  gene_mapping <- readRDS(mapping_file)
+  res_df$entrez_id <- gene_mapping$entrez_id[match(res_df$symbol, gene_mapping$symbol)]
+} else {
+  cat("Mapping symbols to Entrez IDs via org.Hs.eg.db...\n")
+  mapped_ids <- bitr(res_df$symbol, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  res_df$entrez_id <- mapped_ids$ENTREZID[match(res_df$symbol, mapped_ids$SYMBOL)]
+}
+
+# Filter out NAs
+res_df <- res_df[!is.na(res_df$entrez_id) & !is.na(res_df$pvalue) & !is.na(res_df$log2FoldChange), ]
+
+# Prevent Inf values in -log10(pvalue) safely
+pos_pvalues <- res_df$pvalue[res_df$pvalue > 0 & !is.na(res_df$pvalue)]
+min_nonzero_p <- if (length(pos_pvalues) > 0) min(pos_pvalues) else 1e-300
+res_df$pvalue[res_df$pvalue == 0] <- min_nonzero_p
+
+# Create ranking metric: sign(log2FC) * -log10(pvalue)
+res_df$rank_metric <- sign(res_df$log2FoldChange) * (-log10(res_df$pvalue))
+
+# Deduplicate Entrez IDs
+res_df <- res_df[order(abs(res_df$rank_metric), decreasing = TRUE), ]
+res_df <- res_df[!duplicated(res_df$entrez_id), ]
+
+# Create named vector sorted descending
+ranked_genes <- res_df$rank_metric
+names(ranked_genes) <- res_df$entrez_id
+ranked_genes <- sort(ranked_genes, decreasing = TRUE)
+
+cat("   Ranked gene list:", length(ranked_genes), "genes\n")
+saveRDS(ranked_genes, file.path(table_dir, "enrichment_ranked_genes.rds"))
+
+# ---- Step 2: Run GSEA (MSigDB with GO Fallback) ---------------------------
+cat("\nStep 2: Attempting MSigDB retrieval...\n")
+
+gsea_result <- NULL
+
+# Try loading MSigDB online; if Zenodo times out, use local GO GSEA
+tryCatch({
+  h_sets <- msigdbr(species = "Homo sapiens", collection = "H")
+  reactome_sets <- msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:REACTOME")
+  
+  term2gene <- rbind(
+    h_sets[, c("gs_name", "ncbi_gene")],
+    reactome_sets[, c("gs_name", "ncbi_gene")]
+  )
+  colnames(term2gene) <- c("term", "gene")
+  term2gene$gene <- as.character(term2gene$gene)
+  term2gene <- unique(term2gene)
+  
+  cat("   Successfully retrieved MSigDB gene sets. Running GSEA...\n")
+  set.seed(42)
+  gsea_result <- GSEA(
+    geneList      = ranked_genes,
+    TERM2GENE     = term2gene,
+    minGSSize     = 10,
+    maxGSSize     = 500,
+    pvalueCutoff  = 0.05,
+    pAdjustMethod = "BH",
+    seed          = TRUE
+  )
+}, error = function(e) {
+  cat("   [NOTICE] MSigDB/Zenodo connection failed. Switching to local GO Biological Process GSEA...\n")
+  set.seed(42)
+  gsea_result <<- gseGO(
+    geneList     = ranked_genes,
+    OrgDb        = org.Hs.eg.db,
+    ont          = "BP",
+    minGSSize    = 10,
+    maxGSSize    = 500,
+    pvalueCutoff = 0.05,
+    pAdjustMethod= "BH",
+    verbose      = FALSE
+  )
+})
+
+# ---- Step 3: Export & Plot Results ------------------------------------------
+gsea_df <- as.data.frame(gsea_result)
+
+if (nrow(gsea_df) > 0) {
+  gsea_df$direction <- ifelse(gsea_df$NES > 0, "Activated (up in tumor)", "Suppressed (down in tumor)")
+  gsea_df <- gsea_df[order(gsea_df$p.adjust), ]
+  
+  write.csv(gsea_df, file.path(table_dir, "enrichment_gsea_results.csv"), row.names = FALSE)
+  saveRDS(gsea_result, file.path(table_dir, "enrichment_gsea_result.rds"))
+  
+  cat("\n--- Top 10 Enriched Pathways ---\n")
+  print(head(gsea_df[, c("ID", "NES", "pvalue", "p.adjust", "direction")], 10), row.names = FALSE)
+  
+  # Dotplot
+  dotplot_p <- dotplot(gsea_result, showCategory = 20, split = ".sign") +
+    facet_grid(. ~ .sign) +
+    scale_color_gradient(low = "#FF9400", high = "#0279EE") +
+    labs(title = "GSEA: Top Enriched Biological Pathways") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  
+  ggsave(file.path(fig_dir, "enrichment_gsea_dotplot.png"), dotplot_p,
+         width = 11, height = 8, dpi = 300)
+  cat("   Saved figures/enrichment_gsea_dotplot.png\n")
+  
+  # Running score plots
+  top_pathways <- head(gsea_df$ID, min(4, nrow(gsea_df)))
+  if (length(top_pathways) > 0) {
+    p_list <- list()
+    for (pid in top_pathways) {
+      p_list[[pid]] <- gseaplot2(gsea_result, geneSetID = pid, title = pid, pvalue_table = FALSE)
+    }
+    combined_gsea <- plot_grid(plotlist = p_list, ncol = 2)
+    ggsave(file.path(fig_dir, "enrichment_gsea_running_score.png"), combined_gsea,
+           width = 14, height = 10, dpi = 300, bg = "white")
+    cat("   Saved figures/enrichment_gsea_running_score.png\n")
+  }
+} else {
+  cat("   WARNING: No significant pathways identified at padj < 0.05.\n")
+}
+
+cat("\n============================================================\n")
+cat("   Script 05 Complete!\n")
+cat("============================================================\n")

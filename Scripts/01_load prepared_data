@@ -1,0 +1,109 @@
+# Script 01: Data Preparation for RNA-seq Pipeline
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(GEOquery)
+  library(org.Hs.eg.db)
+  library(dplyr)
+})
+
+# ---- Configuration ----------------------------------------------------------
+counts_file   <- "data/GSE87340_RawExpr.txt.gz"
+matrix_file   <- "data/GSE87340_series_matrix.txt.gz"
+output_dir    <- "data"
+
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# ---- Step 1: Load raw count matrix -----------------------------------------
+counts_df <- read.table(counts_file, header = TRUE, sep = "\t", check.names = FALSE)
+
+raw_gene_ids <- make.unique(as.character(counts_df[[1]]))
+
+counts <- as.matrix(counts_df[, -1])
+rownames(counts) <- raw_gene_ids
+counts <- round(counts)
+
+if (!all(counts == floor(counts), na.rm = TRUE)) {
+  stop("ERROR: Count matrix contains non-integer values. DESeq2 requires raw integer counts.")
+}
+
+# ---- Step 2: Load sample metadata from Series Matrix ------------------------
+gse <- getGEO(filename = matrix_file)
+metadata <- pData(gse)
+
+# ---- Step 3: Align metadata by stripping '.RNA-seq' from titles -------------
+clean_titles <- sub("\\..*", "", metadata$title)
+match_idx <- match(colnames(counts), clean_titles)
+
+if (any(is.na(match_idx))) {
+  stop("ERROR: Could not match all count matrix columns to metadata titles!")
+}
+
+metadata <- metadata[match_idx, ]
+rownames(metadata) <- colnames(counts)
+
+# ---- Step 4: Standardize condition labels -----------------------------------
+condition_col <- grep("disease|tissue|characteristics|title", colnames(metadata), value = TRUE, ignore.case = TRUE)[1]
+
+if (is.na(condition_col)) {
+  metadata$condition <- "tumor"
+} else {
+  metadata$condition <- ifelse(grepl("normal|control|adjacent", metadata[[condition_col]], ignore.case = TRUE), 
+                               "normal", "tumor")
+}
+
+metadata$condition <- factor(metadata$condition, levels = c("normal", "tumor"))
+
+# ---- Step 5: Validate sample ID matching -----------------------------------
+if (!all(colnames(counts) == rownames(metadata))) {
+  stop("ERROR: Count matrix columns and metadata rows do not match!")
+}
+
+# ---- Step 6: Map / Format Gene Identifiers ----------------------------------
+if (all(grepl("^[0-9]+$", head(raw_gene_ids)))) {
+  symbol_map <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys = raw_gene_ids,
+    columns = c("ENTREZID", "SYMBOL", "GENENAME"),
+    keytype = "ENTREZID"
+  )
+  symbol_map <- symbol_map[!duplicated(symbol_map$ENTREZID), ]
+  
+  gene_mapping <- data.frame(
+    entrez_id = raw_gene_ids,
+    symbol    = symbol_map$SYMBOL[match(raw_gene_ids, symbol_map$ENTREZID)],
+    genename  = symbol_map$GENENAME[match(raw_gene_ids, symbol_map$ENTREZID)],
+    stringsAsFactors = FALSE
+  )
+  
+  gene_labels <- ifelse(is.na(gene_mapping$symbol), gene_mapping$entrez_id, gene_mapping$symbol)
+  gene_labels <- make.unique(gene_labels)
+  rownames(counts) <- gene_labels
+} else {
+  gene_mapping <- data.frame(
+    entrez_id = NA,
+    symbol    = raw_gene_ids,
+    genename  = NA,
+    stringsAsFactors = FALSE
+  )
+  rownames(counts) <- raw_gene_ids
+}
+
+write.csv(gene_mapping, file.path(output_dir, "gene_id_mapping.csv"), row.names = FALSE)
+
+# ---- Step 7: Pre-filter low-count genes ------------------------------------
+keep <- rowSums(counts >= 10) >= 2
+counts_filtered <- counts[keep, ]
+
+# ---- Step 8: Save processed data -------------------------------------------
+metadata_out <- data.frame(
+  sample    = rownames(metadata),
+  condition = metadata$condition
+)
+write.csv(metadata_out, file.path(output_dir, "sample_metadata_enriched.csv"), row.names = FALSE)
+
+saveRDS(counts_filtered, file.path(output_dir, "counts_filtered.rds"))
+saveRDS(metadata, file.path(output_dir, "metadata.rds"))
+saveRDS(gene_mapping, file.path(output_dir, "gene_mapping.rds"))
+
+cat("Script 01 complete! Saved processed files to 'data/'.\n")

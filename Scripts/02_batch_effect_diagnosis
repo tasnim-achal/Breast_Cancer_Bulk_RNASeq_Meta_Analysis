@@ -1,0 +1,22 @@
+# ---- Step 1: Load data and derive batch variable ----------------------------
+counts <- readRDS(file.path(data_dir, "counts_filtered.rds"))
+meta   <- readRDS(file.path(data_dir, "metadata.rds"))
+
+# CRITICAL FIX: Clean NA values from count matrix
+if (any(is.na(counts))) {
+  cat("Warning: Found NA values in count matrix. Cleaning missing values...\n")
+  # Remove rows with NA values
+  counts <- counts[complete.cases(counts), ]
+}
+
+# Derive batch from GSM accession numbers
+gsm_ids <- if ("geo_accession" %in% colnames(meta)) meta$geo_accession else rownames(meta)
+gsm_numbers <- as.numeric(gsub("[^0-9]", "", gsm_ids))
+
+# Split into Batch 1 and Batch 2 based on accession order
+med_gsm <- median(gsm_numbers, na.rm = TRUE)
+meta$batch <- ifelse(gsm_numbers <= med_gsm, "Batch1", "Batch2")
+meta$batch <- as.factor(meta$batch)
+
+cat("Batch distribution:\n")
+print(table(meta$batch))

@@ -1,0 +1,217 @@
+# =============================================================================
+# Script 07: WGCNA Network Construction
+# =============================================================================
+# WHAT: Build a weighted gene co-expression network from the VST-transformed
+#       expression data. Steps:
+#       (1) Load VST data and select top 5,000 most variable genes
+#       (2) Check sample quality (goodSamplesGenes)
+#       (3) Choose soft thresholding power (pickSoftThreshold)
+#       (4) Construct network and detect modules (blockwiseModules)
+#       (5) Generate soft-power diagnostic plot and gene dendrogram
+#
+# WHY:  WGCNA groups genes into modules based on co-expression patterns across
+#       samples to identify COORDINATED regulatory programs.
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(WGCNA)
+  library(ggplot2)
+})
+
+# Enable WGCNA multithreading if supported
+allowWGCNAThreads()
+
+# ---- Configuration ----------------------------------------------------------
+fig_dir   <- "figures"
+table_dir <- "tables"
+data_dir  <- "data"
+
+if (!dir.exists(fig_dir))   dir.create(fig_dir, recursive = TRUE)
+if (!dir.exists(table_dir)) dir.create(table_dir, recursive = TRUE)
+
+# WGCNA parameters
+n_genes_select   <- 5000   # top variable genes for network
+min_module_size  <- 30     # minimum genes per module
+merge_cut_height <- 0.25   # merge threshold for similar modules
+network_type     <- "signed" # signed network preserves correlation direction
+
+# ---- Step 1: Load VST data and select top variable genes -------------------
+cat("Step 1: Loading VST data and selecting top variable genes...\n")
+vst_mat <- readRDS(file.path(data_dir, "vst_transformed.rds"))
+cat("  VST matrix:", nrow(vst_mat), "genes x", ncol(vst_mat), "samples\n")
+
+# WGCNA expects samples as rows, genes as columns (transposed)
+datExpr0 <- t(vst_mat)
+
+# Select top variable genes
+gene_var  <- apply(datExpr0, 2, var)
+n_select  <- min(n_genes_select, ncol(datExpr0))
+top_genes <- names(sort(gene_var, decreasing = TRUE))[1:n_select]
+datExpr   <- datExpr0[, top_genes]
+
+cat("  Selected top", ncol(datExpr), "most variable genes\n")
+cat("  Data dimensions for WGCNA:", nrow(datExpr), "samples x", ncol(datExpr), "genes\n")
+
+# ---- Step 2: Sample quality check ------------------------------------------
+cat("\nStep 2: Checking sample and gene quality (goodSamplesGenes)...\n")
+gsg <- goodSamplesGenes(datExpr, verbose = 0)
+if (!gsg$allOK) {
+  cat("  WARNING: Removing flagged samples/genes\n")
+  if (sum(!gsg$goodGenes) > 0)   datExpr <- datExpr[, gsg$goodGenes]
+  if (sum(!gsg$goodSamples) > 0) datExpr <- datExpr[gsg$goodSamples, ]
+} else {
+  cat("  All samples and genes passed quality check\n")
+}
+cat("  Final dimensions:", nrow(datExpr), "samples x", ncol(datExpr), "genes\n")
+
+# ---- Step 3: Soft thresholding power selection ------------------------------
+cat("\nStep 3: Selecting soft thresholding power...\n")
+
+powers <- c(1:20)
+sft <- pickSoftThreshold(
+  datExpr, 
+  powerVector = powers, 
+  networkType = network_type,
+  verbose     = 0, 
+  blockSize   = 5000
+)
+
+sft_summary    <- sft$fitIndices
+r2_values      <- -sign(sft_summary$slope) * sft_summary$SFT.R.sq
+power_selected <- sft$powerEstimate
+
+# Fallback if automatic detection returns NA or exceeds range
+if (is.na(power_selected) || power_selected > 20) {
+  candidates <- which(r2_values >= 0.8)
+  if (length(candidates) > 0) {
+    power_selected <- powers[candidates[1]]
+  } else {
+    power_selected <- 12 # Recommended default for signed networks
+  }
+}
+
+cat("  Scale-free R^2 values by power:\n")
+for (i in seq_along(powers)) {
+  cat("    Power", sprintf("%2d", powers[i]), ": R^2 =", round(r2_values[i], 3), "\n")
+}
+cat("  Selected soft power:", power_selected, "(R^2 =", round(r2_values[power_selected], 3), ")\n")
+
+# ---- Step 4: Soft power diagnostic plot ------------------------------------
+cat("\nStep 4: Generating soft power diagnostic plot...\n")
+
+sft_df <- data.frame(
+  Power            = powers,
+  R2               = r2_values,
+  MeanConnectivity = sft_summary$mean.k.
+)
+
+p1 <- ggplot(sft_df, aes(x = Power, y = R2)) +
+  geom_line(color = "#0279EE", linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0.8, linetype = "dashed", color = "#FF9400") +
+  geom_vline(xintercept = power_selected, linetype = "dashed", color = "grey50") +
+  annotate("text", x = min(power_selected + 2, 19), y = 0.82, label = paste("Power =", power_selected), size = 3) +
+  labs(title = "Scale-Free Topology Fit", x = "Soft Power", y = "Scale-Free R^2") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+p2 <- ggplot(sft_df, aes(x = Power, y = MeanConnectivity)) +
+  geom_line(color = "#FF9400", linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = power_selected, linetype = "dashed", color = "grey50") +
+  labs(title = "Mean Connectivity", x = "Soft Power", y = "Mean Connectivity") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+# Combine plots cleanly
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  library(patchwork)
+  sft_plot <- p1 + p2 + plot_annotation(
+    title = "WGCNA Soft Power Selection",
+    theme = theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  )
+} else {
+  library(gridExtra)
+  sft_plot <- grid.arrange(p1, p2, ncol = 2)
+}
+
+ggsave(file.path(fig_dir, "wgcna_soft_power.png"), sft_plot, width = 12, height = 5, dpi = 300, bg = "white")
+cat("  Saved figures/wgcna_soft_power.png\n")
+
+# ---- Step 5: Network construction and module detection ---------------------
+cat("\nStep 5: Constructing co-expression network (blockwiseModules)...\n")
+cat("  Parameters: power =", power_selected, "| minModuleSize =", min_module_size,
+    "| mergeCutHeight =", merge_cut_height, "| type =", network_type, "\n")
+
+net <- blockwiseModules(
+  datExpr,
+  power             = power_selected,
+  networkType       = network_type,
+  TOMType           = network_type,
+  minModuleSize     = min_module_size,
+  mergeCutHeight    = merge_cut_height,
+  numericLabels     = TRUE,
+  saveTOMs          = TRUE,
+  saveTOMFileBase   = file.path(data_dir, "wgcna_TOM"),
+  verbose           = 0,
+  maxBlockSize      = 5000
+)
+
+# Convert numeric labels to colors
+moduleColors <- labels2colors(net$colors)
+n_modules    <- length(unique(moduleColors)) - ifelse("grey" %in% moduleColors, 1, 0)
+n_grey       <- sum(moduleColors == "grey")
+
+cat("  Network construction completed\n")
+cat("  Modules detected (excluding grey):", n_modules, "\n")
+cat("  Genes in grey module (unassigned):", n_grey, "\n")
+cat("  Module sizes:\n")
+print(table(moduleColors))
+
+# ---- Step 6: Gene dendrogram with module colors ----------------------------
+cat("\nStep 6: Generating gene dendrogram with module colors...\n")
+
+geneTree <- net$dendrograms[[1]]
+
+png(file.path(fig_dir, "wgcna_dendrogram.png"), width = 12, height = 7, units = "in", res = 300)
+plotDendroAndColors(
+  geneTree,
+  moduleColors[net$blockGenes[[1]]],
+  "Module",
+  dendroLabels = FALSE,
+  hang         = 0.03,
+  addGuide     = TRUE,
+  guideHang    = 0.05,
+  main         = "Gene Dendrogram and Module Colors"
+)
+dev.off()
+cat("  Saved figures/wgcna_dendrogram.png\n")
+
+# ---- Step 7: Export results -------------------------------------------------
+cat("\nStep 7: Exporting results...\n")
+
+gene_modules <- data.frame(
+  gene   = colnames(datExpr),
+  module = moduleColors,
+  stringsAsFactors = FALSE
+)
+write.csv(gene_modules, file.path(table_dir, "wgcna_gene_modules.csv"), row.names = FALSE)
+
+saveRDS(net,          file.path(data_dir, "wgcna_network.rds"))
+saveRDS(datExpr,      file.path(data_dir, "wgcna_datExpr.rds"))
+saveRDS(moduleColors, file.path(data_dir, "wgcna_module_colors.rds"))
+saveRDS(power_selected, file.path(data_dir, "wgcna_power.rds"))
+cat("  Saved tables and RDS objects to 'tables/' and 'data/'.\n")
+
+# ---- Summary ----------------------------------------------------------------
+cat("\n============================================================\n")
+cat("  WGCNA NETWORK CONSTRUCTION COMPLETE\n")
+cat("============================================================\n")
+cat("  Input: VST-transformed counts (top", ncol(datExpr), "variable genes)\n")
+cat("  Samples:", nrow(datExpr), "\n")
+cat("  Soft power:", power_selected, "(scale-free R^2 =", round(r2_values[power_selected], 3), ")\n")
+cat("  Modules detected (excl. grey):", n_modules, "\n")
+cat("  Grey module (unassigned):", n_grey, "genes\n")
+cat("  Figures: wgcna_soft_power.png, wgcna_dendrogram.png\n")
+cat("  Tables: wgcna_gene_modules.csv\n")
+cat("============================================================\n")
